@@ -1,5 +1,4 @@
 #! /usr/bin/env python3
-
 # The MIT License (MIT)
 #
 # Copyright (c) 2016 leif
@@ -55,6 +54,25 @@ conn = None  # connection to hypervisor
 import smtplib
 
 
+def get_copy_command():
+    global args
+    if args.rate < 0.01:
+        copy_command = "cp --sparse=always "
+    else:
+        # copy_command = "rsync --sparse  --bwlimit={:.1f}m ".format(args.rate)
+        # OBS! I have to multiply with 4.2 to get bwlimit to resonable limit for our transfers
+        copy_command = "rsync --sparse  --bwlimit={:d} ".format(args.rate*1024*5)
+    return copy_command
+
+
+def validate_blockinfo(job_info):
+    """return true if active blockjob is running"""
+    if job_info:
+        if job_info['type'] == libvirt.VIR_DOMAIN_BLOCK_JOB_TYPE_ACTIVE_COMMIT:
+            return True
+    return False
+
+
 class Sender(object):
     """E-mail stuff to people"""
     def __init__(self):
@@ -99,7 +117,25 @@ class Dom(object):
         self.devices = []
         self.devices_not_snapshotted = []
         self.TOTAL_ALLOCATED_SIZE = 0
+        self.libvirt_label = None
+        self.backup_start_time = None
+        self.backup_end_time = None
         self.__get_target_devices()
+
+    def __disable_apparmor(self):
+        if self.libvirt_label:
+            try:
+                subprocess.check_call("apparmor_parser -R /etc/apparmor.d/libvirt/" + str(self.libvirt_label), shell=True)
+            except subprocess.CalledProcessError as err:
+                raise FatalKvmBackupException(str(err))
+
+    def __enable_apparmor(self):
+        if self.libvirt_label:
+            try:
+                subprocess.check_call("apparmor_parser /etc/apparmor.d/libvirt/" + str(self.libvirt_label), shell=True)
+            except subprocess.CalledProcessError:
+                print("Cannot enable apparmor profile:" + str(self.libvirt_label))
+                send_error("Cannot enable apparmor profile:" + str(self.libvirt_label))
 
     # Function to return a list of block devices used.
     def __get_target_devices(self):
@@ -113,6 +149,16 @@ class Dom(object):
         if len(self.devices) == 0:
             # Create a XML tree from the domain XML description.
             tree = ElementTree.fromstring(self.dom.XMLDesc(0))
+
+            # check for libvirt profile (need to be disabled on certain servers to allow snapshot
+            sl = tree.find('seclabel')
+            if sl:
+                if sl.get('model') == 'apparmor':
+                    tmp1 = sl.find('label')
+                    if tmp1 is None:
+                        raise FatalKvmBackupException("Cannot find libvirt label for dom {:s}".format(self.dom.name()))
+                    else:
+                        self.libvirt_label = tmp1.text
 
             for target in tree.findall("devices/disk"):
                 if target.get('device') == 'disk' and target.get('type') == 'file':
@@ -172,6 +218,12 @@ class Dom(object):
             send_error("backup destination unavailable {:s}".format(str(err)))
             raise FatalKvmBackupException(err)
         return backups
+
+    def shutdown(self):
+        return self.dom.shutdownFlags(libvirt.VIR_DOMAIN_SHUTDOWN_GUEST_AGENT)
+
+    def start(self):
+        return self.dom.create()
 
     def get_current_file(self, dev_name):
         # dom_tmp = conn.lookupByName(self.dom.name())
@@ -264,36 +316,47 @@ class Dom(object):
         disk = device.dev
         base = None  # will be the bottom of the chain
         top = None  # the active image at the top of the chain will be used
-        self.dom.blockCommit(disk, base, top, flags=libvirt.VIR_DOMAIN_BLOCK_COMMIT_ACTIVE)
+        self.dom.blockCommit(disk, base, top,
+                             flags=libvirt.VIR_DOMAIN_BLOCK_COMMIT_ACTIVE)
         # libvirt.VIR_DOMAIN_BLOCK_COMMIT_DELETE # not possible with leaving job running
         timeout_time = datetime.datetime.now() + datetime.timedelta(minutes=args.timeout)
         while True:
             try:
-                ret = self.dom.blockJobAbort(
-                    disk,
-                    flags=libvirt.VIR_DOMAIN_BLOCK_JOB_ABORT_ASYNC |
-                    libvirt.VIR_DOMAIN_BLOCK_JOB_ABORT_PIVOT)
-                if ret == 0:
-                    # remove the temporary image when blockcommit is done
-                    tmp_snapshot_filename = "{:s}/{:s}_{:s}".format(
-                        device.file_dir, backup_time.strftime(date_format), device.file_base)
+                job_info = self.dom.blockJobInfo(disk)
+                if validate_blockinfo(job_info):
+                    logging.debug("blockjob running: " + str(job_info))
+                    ret = self.dom.blockJobAbort(
+                        disk,
+                        flags=libvirt.VIR_DOMAIN_BLOCK_JOB_ABORT_ASYNC |
+                        libvirt.VIR_DOMAIN_BLOCK_JOB_ABORT_PIVOT)
+                    if ret == 0:
+                        if args.remove_tmp_file:
+                            # remove the temporary image when blockcommit is done
+                            tmp_snapshot_filename = "{:s}/{:s}_{:s}".format(
+                                device.file_dir, backup_time.strftime(date_format), device.file_base)
 
-                    timeout_file_remove = datetime.datetime.now() + datetime.timedelta(seconds=20)
-                    while datetime.datetime.now() < timeout_file_remove:
-                        logging.debug("blockcommit: done remove tmp file:" + tmp_snapshot_filename + " current is:" +
-                                      self.get_current_file(device.dev))
-                        if self.get_current_file(device.dev) != tmp_snapshot_filename:
-                            try:
-                                os.remove(tmp_snapshot_filename)
-                                break
-                            except OSError:
-                                send_error("Cannot remove temporary snapshot file " + tmp_snapshot_filename)
-                                break
-                        time.sleep(1)
+                            timeout_file_remove = datetime.datetime.now() + datetime.timedelta(seconds=20)
+                            while datetime.datetime.now() < timeout_file_remove:
+                                logging.debug("blockcommit: done remove tmp file:" + tmp_snapshot_filename + " current is:" +
+                                              self.get_current_file(device.dev))
+                                if self.get_current_file(device.dev) != tmp_snapshot_filename:
+                                    time.sleep(5)   # give it a few seconds extra just in case
+                                    try:
+                                        os.remove(tmp_snapshot_filename)
+                                        break
+                                    except OSError:
+                                        send_error("Cannot remove temporary snapshot file " + tmp_snapshot_filename)
+                                        break
+                                time.sleep(1)
 
-                    if self.get_current_file(device.dev) == tmp_snapshot_filename:
-                        send_error("Timeout removing temporary snapshot file " + tmp_snapshot_filename)
-                    break
+                            if self.get_current_file(device.dev) == tmp_snapshot_filename:
+                                send_error("Timeout removing temporary snapshot file " + tmp_snapshot_filename)
+                        break
+                else:
+                    # this should not happen since blockcommit started above
+                    raise FatalKvmBackupException("blockcommit disappeared for {:s} {:s} ".format(
+                        self.dom.name(), device.dev))
+
                 if datetime.datetime.now() > timeout_time:
                     raise FatalKvmBackupException("Timeout in blockcommit for {:s} {:s} (minutes {:d})".format(
                         self.dom.name(), device.dev, args.timeout
@@ -301,7 +364,7 @@ class Dom(object):
                 time.sleep(1)
             except libvirt.libvirtError as err:
                 logging.debug("blockcommit: waiting for pivot " + str(err))
-                time.sleep(1)
+                time.sleep(5)
 
     def begin_backup(self):
         global BACKUP_DST
@@ -310,13 +373,13 @@ class Dom(object):
 
         # used to check that the destionation is available before starting backup
         self.__get_existing_backups()
-
         backup_dst_mine = os.path.join(BACKUP_DST, self.dom.name())  # this destination must exist now !
         if os.path.exists(backup_dst_mine):
             # directory exists and we already know there is space in the main BACKUP_DST from dom loading
             backup_time = datetime.datetime.now()
+            self.backup_start_time = backup_time
             backup_dir = os.path.join(backup_dst_mine, backup_time.strftime(date_format))
-            backup_completed_successfully = False
+            backup_completed_successfully = True
             try:
                 backup_xml_file = os.path.join(backup_dir, "{:s}.xml".format(self.dom.name()))
                 if args.dryrun:
@@ -330,15 +393,15 @@ class Dom(object):
                         for device in self.devices:
                                 # check that we are running on new file
                                 current_file = self.get_current_file(device.dev)
-                                print("** run cp --sparse=always " + device.file + " " + backup_dir)
+                                print("** run " + get_copy_command() + device.file + " " + backup_dir)
                                 if current_file != device.file:
                                     # copy the original file
-                                    subprocess.check_call("cp --sparse=always " + device.file +
+                                    subprocess.check_call(get_copy_command() + device.file +
                                                           " " + backup_dir, shell=True)
                                 print("** doing self.blockcommit(device)")
                     except libvirt.libvirtError as err:
                         # cleanup the device copy process
-                        # directory cleanup below in backup_completed_successfully
+                        backup_completed_successfully = False
                         if device is not None:
                             # the backup was started need to check for snapshots in devices
                             for device in self.devices:
@@ -349,8 +412,8 @@ class Dom(object):
                         raise FatalKvmBackupException(err)
 
                     self.cleanup_backup()
-                    backup_completed_successfully = True
                 else:
+                    self.__disable_apparmor()      # must be done on current ubuntu
                     os.mkdir(backup_dir)
                     # copy xml
                     f = open(backup_xml_file, 'w')
@@ -365,27 +428,33 @@ class Dom(object):
                             # this code should not be entered since an exception would be thrown in libvirt
                             logging.debug("This code should not be entered"
                                           " Snapshot creation failed " + self.dom.name())
+                            backup_completed_successfully = False
                         else:
                             libvirt_errors = []
                             for device in self.devices:
                                 # check that we are running on new file
                                 current_file = self.get_current_file(device.dev)
-                                logging.debug("** run cp --sparse=always " + device.file + " " + backup_dir)
-                                if current_file != device.file:
-                                    subprocess.check_call("cp --sparse=always " +
-                                                          device.file + " " + backup_dir, shell=True)
-
+                                logging.debug("** run " + get_copy_command() + device.file + " " + backup_dir)
+                                try:
+                                    if current_file != device.file:
+                                        subprocess.check_call(get_copy_command() +
+                                                              device.file + " " + backup_dir, shell=True)
+                                except subprocess.CalledProcessError as err:
+                                    backup_completed_successfully = False
+                                    print("ERROR: file copy process failed {:s}".format(str(err)))
+                                    send_error("file copy process failed {:s}".format(str(err)))
                                 logging.debug("** doing self.blockcommit(device) device=" + device.dev)
                                 try:
                                     self.blockcommit(device, backup_time)
                                 except libvirt.libvirtError as err:
                                     libvirt_errors.append(err)
                             if libvirt_errors:
+                                backup_completed_successfully = False
                                 raise FatalKvmBackupException(
                                     "Cannot blockcommit after snapshot for " + self.dom.name())
                     except libvirt.libvirtError as err:
                         # cleanup the device copy process
-                        # directory cleanup below in backup_completed_successfully
+                        backup_completed_successfully = False
                         if device is not None:
                             # the backup was started need to check for snapshots in devices
                             for device in self.devices:
@@ -396,22 +465,109 @@ class Dom(object):
                         raise FatalKvmBackupException(err)
 
                     self.cleanup_backup()
-                    backup_completed_successfully = True
             except OSError as err:
-                send_error("cannot create backup directory {:s}".format(str(err)))
+                backup_completed_successfully = False
+                # send_error("cannot create backup directory {:s}".format(str(err)))
                 raise FatalKvmBackupException(err)
             finally:
+                if not args.dryrun:
+                    self.__enable_apparmor()
+                self.backup_end_time = datetime.datetime.now()
                 if not backup_completed_successfully:
+                    # cleanup files for this failed backup
+                    if os.path.exists(backup_dir):
+                        if args.dryrun:
+                            print("** will remove:" + backup_dir)
+                        else:
+                            try:
+                                shutil.rmtree(backup_dir)
+                            except (PermissionError, FileNotFoundError):
+                                send_error("Cannot remove backup folder " + backup_dir)
                     send_error("backup failed for {:s} in backup directory:{:s}".format(self.dom.name(), backup_dir),
                                subject="Backup failed for {:s} {:s}".format(
                                    self.dom.name(), backup_time.strftime(date_format)))
                     logging.debug("backup failed!")
-                    # os.rmdir(backup_dir)
                 else:
-                    send_error("backup completed for {:s} in backup directory:{:s}".format(self.dom.name(), backup_dir),
-                               subject="Backup completed for {:s} {:s}".format(self.dom.name(),
-                                                                               backup_time.strftime(date_format)))
+                    duration = datetime.timedelta(0)
+                    if self.backup_start_time and self.backup_end_time:
+                        duration = self.backup_end_time - self.backup_start_time
+                    send_error("backup completed for {:s} in backup directory:{:s} size:{:s} {:.2f} Mb/s".format(
+                        self.dom.name(), backup_dir, sizeof_fmt(self.TOTAL_ALLOCATED_SIZE),
+                        self.TOTAL_ALLOCATED_SIZE*1e-6/duration.total_seconds()),
+                        subject="Backup completed for {:s} {:s} duration:{:s}".format(self.dom.name(),
+                                                                                      backup_time.strftime(date_format),
+                                                                                      str(duration).split('.', 2)[0]))
+        else:
+            send_error("backup destination unavailable ({:s})".format(backup_dst_mine))
 
+    def begin_offline_backup(self):
+        global BACKUP_DST
+        global args
+        global date_format
+
+        # used to check that the destionation is available before starting backup
+        self.__get_existing_backups()
+        backup_dst_mine = os.path.join(BACKUP_DST, self.dom.name())  # this destination must exist now !
+        backup_dir = None  # in case backup fails and this is not None cleanup files
+        if os.path.exists(backup_dst_mine):
+            # directory exists and we already know there is space in the main BACKUP_DST from dom loading
+            backup_time = datetime.datetime.now()
+            self.backup_start_time = backup_time
+            backup_dir = os.path.join(backup_dst_mine, backup_time.strftime(date_format))
+            backup_completed_successfully = True
+            try:
+                backup_xml_file = os.path.join(backup_dir, "{:s}.xml".format(self.dom.name()))
+                if args.dryrun:
+                    print("** will create " + backup_dir)
+                    print("** save xml to " + backup_xml_file)
+                    for device in self.devices:
+                            print("** run " + get_copy_command() + device.file + " " + backup_dir)
+                else:
+                    os.mkdir(backup_dir)
+                    # copy xml
+                    f = open(backup_xml_file, 'w')
+                    f.write(self.persistent_xml)
+                    f.close()
+                    for device in self.devices:
+                        logging.debug("** run " + get_copy_command() + device.file + " " + backup_dir)
+                        try:
+                            subprocess.check_call(get_copy_command() +
+                                                  device.file + " " + backup_dir, shell=True)
+                        except subprocess.CalledProcessError as err:
+                            backup_completed_successfully = False
+                            print("ERROR: file copy process failed {:s}".format(str(err)))
+                            send_error("file copy process failed {:s}".format(str(err)))
+            except OSError as err:
+                backup_completed_successfully = False
+                # send_error("cannot create backup directory {:s}".format(str(err)))
+                raise FatalKvmBackupException(err)
+            finally:
+                self.backup_end_time = datetime.datetime.now()
+                if not backup_completed_successfully:
+                    # cleanup files for this failed backup
+                    if os.path.exists(backup_dir):
+                        if args.dryrun:
+                            print("** will remove:" + backup_dir)
+                        else:
+                            try:
+                                shutil.rmtree(backup_dir)
+                            except (PermissionError, FileNotFoundError):
+                                send_error("Cannot remove backup folder " + backup_dir)
+                    send_error("backup failed for {:s} in backup directory:{:s}".format(self.dom.name(), backup_dir),
+                               subject="Backup failed for {:s} {:s}".format(
+                                   self.dom.name(), backup_time.strftime(date_format)))
+                    logging.debug("backup failed!")
+                else:
+                    self.cleanup_backup()
+                    duration = datetime.timedelta(0)
+                    if self.backup_start_time and self.backup_end_time:
+                        duration = self.backup_end_time - self.backup_start_time
+                    send_error("backup completed for {:s} in backup directory:{:s} size:{:s} {:.2f} Mb/s".format(
+                        self.dom.name(), backup_dir, sizeof_fmt(self.TOTAL_ALLOCATED_SIZE),
+                        self.TOTAL_ALLOCATED_SIZE*1e-6/duration.total_seconds()),
+                        subject="Backup completed for {:s} {:s} duration:{:s}".format(self.dom.name(),
+                                                                                      backup_time.strftime(date_format),
+                                                                                      str(duration).split('.', 2)[0]))
         else:
             send_error("backup destination unavailable ({:s})".format(backup_dst_mine))
 
@@ -449,11 +605,16 @@ def parse_arguments(myargs):
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--dest", type=str, default='/tmp', help="Backup destination folder")
     parser.add_argument("-k", "--keep", type=int, default=2, help="Number of backups to keep")
+    parser.add_argument("-r", "--rate", type=int, default=0, help="bandwith limit in MiB/s ex. 20")
     parser.add_argument("-t", "--timeout", type=int, default=60,
                         help="Number of minutes to wait for blockcommit to finish")
     parser.add_argument("-n", "--dryrun",  action="store_true", help='do not perform backup just inform')
+    parser.add_argument("--remove_tmp_file",  action="store_true",
+                        help='remove external snapshot file(s) when blockcommit is finished')
     parser.add_argument("-D", "--disks",  action='append', help='backup all disks if this list of disks is empty. '
                                                                 'This option can be used multiple times')
+    parser.add_argument("--noactive",  action="store_true", help='do not perform perform backup if host is on')
+    parser.add_argument("--force_noactive",  action="store_true", help='shutdown vm and do offline backup')
     parser.add_argument('vms', metavar='vms', nargs='+', help='virtual machines to backup')
     return parser.parse_args(myargs)
 
@@ -482,13 +643,48 @@ if __name__ == "__main__":
             dom_tmp = conn.lookupByName(vm)
             if dom_tmp.isActive() == 1:
                 domain = Dom(dom_tmp)
-                domain.begin_backup()
+                if args.force_noactive:
+                    if domain.shutdown() == 0:
+                        timeout_down = datetime.datetime.now() + datetime.timedelta(seconds=30)
+                        while domain.dom.isActive():
+                            if datetime.datetime.now() > timeout_down:
+                                break
+                            logging.debug("waiting for domain to go down active:{:d}".format(domain.dom.isActive()))
+                            time.sleep(5)
+                        if domain.dom.isActive():
+                            print("Timeout in shutdown of {:s}".format(vm))
+                            raise FatalKvmBackupException("Timeout in shutdown of {:s}".format(vm))
+                        # OK continue
+                        domain.begin_offline_backup()
+                        if domain.start() == 0:
+                            timeout_up = datetime.datetime.now() + datetime.timedelta(seconds=30)
+                            while not domain.dom.isActive():
+                                if datetime.datetime.now() > timeout_up:
+                                    break
+                                logging.debug("waiting for domain to start active:{:s}".format(
+                                    str(domain.dom.isActive())))
+                                time.sleep(5)
+                            if not domain.dom.isActive():
+                                print("Timeout in startup of {:s}".format(vm))
+                                raise FatalKvmBackupException("Timeout in startup of {:s}".format(vm))
+                        else:
+                            print("ERROR in startup of {:s}".format(vm))
+                            raise FatalKvmBackupException("ERROR in startup of {:s}".format(vm))
+                    else:
+                        print("ERROR in shutdown of {:s}".format(vm))
+                        raise FatalKvmBackupException("ERROR in shutdown of {:s}".format(vm))
+                else:
+                    if not args.noactive:
+                        domain.begin_backup()
+                    else:
+                        print("{:s} is on will not perform backup (--noactive option)".format(vm))
+                        send_error("{:s} is on will not perform backup (--noactive option)".format(vm))
             else:
-                print(vm + " is not active, cannot make active backup")
-                send_error("vm is not active, cannot make active backup", subject="Backup failed for {:s} ".format(vm))
+                domain = Dom(dom_tmp)
+                domain.begin_offline_backup()
 
     except Exception as e:
-        print(str(e))
+        logging.exception("Last exception clause")
         send_error(str(e))
         sys.exit(1)
     conn.close()
