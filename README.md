@@ -1,14 +1,18 @@
-# kvmbackup
-live backup of kvm virtual guests with external snapshot and blockcommit
+### Kvmbackup
+Backup of kvm virtual guests.
+
+### status
+offline backup is used in small production environment.
+live backup does not work with current libvirt 
+(blockcopy always failed when with option "--pivot")
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1197592
 
 ### Usage                        
 usage: kvm_backup.py [-h] [-d DEST] [-k KEEP] [-r RATE] [-t TIMEOUT] [-n]
-
-                     [--remove_tmp_file] [-D DISKS] [--noactive]
-                     
-                     [--force_noactive]
-                     
-                     vms [vms ...]
+  [--remove_tmp_file] [-D DISKS] [--noactive]
+  [--force_noactive]
+  vms [vms ...]
 
 positional arguments:
   vms                   virtual machines to backup
